@@ -3,4 +3,4 @@ pandas
 streamlit
 matplotlib
 scipy
-sklearn
+scikit-learn
