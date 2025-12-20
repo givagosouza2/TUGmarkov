@@ -220,7 +220,7 @@ def plot_signal(t_s, y, overlays, title, ylabel="Norma (filtrada)"):
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, which="both")
-    ax.legend(loc="upper right")
+    #ax.legend(loc="upper right")
     return fig
 
 def plot_states_band(t_s, states_dict, title):
