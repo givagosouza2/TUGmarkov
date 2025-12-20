@@ -1,31 +1,31 @@
-# markov_simplificado.py
+# markov_simplificado_xyz.py
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
 from sklearn.cluster import KMeans
-from scipy.signal import butter, filtfilt
 
-st.set_page_config(page_title="Markov – Segmentação", layout="wide")
-st.title("📌 Segmentação por Estados + Critérios (Markov / Semi-Markov)")
+st.set_page_config(page_title="Markov – Segmentação (XYZ)", layout="wide")
+st.title("📌 Markov / Semi-Markov — Segmentação a partir de arquivo XYZ (seu formato)")
 
 # ============================================================
-# IO + (opcional) filtro simples
+# IO
 # ============================================================
 def read_table_any(file):
+    """Lê CSV/TXT tentando ';' e depois separador automático."""
     try:
         return pd.read_csv(file, sep=";")
     except Exception:
         file.seek(0)
         return pd.read_csv(file, sep=None, engine="python")
 
-def lowpass(x, fs, fc, order=4):
-    wn = fc / (fs / 2)
-    if not (0 < wn < 1):
-        raise ValueError("Cutoff inválido (normalizado fora de (0,1)).")
-    b, a = butter(order, wn, btype="low")
-    return filtfilt(b, a, x)
+def find_first_existing(cols, candidates):
+    cols_set = set([c.strip() for c in cols])
+    for c in candidates:
+        if c in cols_set:
+            return c
+    return None
 
 # ============================================================
 # SEMI-MARKOV / MARKOV HELPERS
@@ -181,40 +181,46 @@ def plot_states(t_s, states, K, title="Estados (normalizados)"):
 # ============================================================
 with st.sidebar:
     st.header("Arquivo")
-    file = st.file_uploader("CSV/TXT", type=["csv", "txt"])
+    file = st.file_uploader("TXT/CSV (seu modelo)", type=["txt", "csv"])
 
-    st.header("Colunas")
-    col_t = st.text_input("Tempo (ms)", "tempo")
-    col_y = st.text_input("Sinal (1D)", "norma")
+    st.header("Colunas (defaults compatíveis com seu arquivo)")
+    col_t = st.text_input("Tempo (ms)", "DURACAO")
+    col_x = st.text_input("Eixo X", "AVL EIXO X")
+    col_y = st.text_input("Eixo Y", "AVL EIXO Y")
+    col_z = st.text_input("Eixo Z", "AVL EIXO Z")
 
-    st.header("Amostragem")
-    infer_fs = st.checkbox("Inferir fs pelo tempo (recomendado)", True)
-    fs_manual = st.number_input("fs manual (Hz)", 1.0, 1000.0, 100.0, 1.0, disabled=infer_fs)
-
-    st.header("Filtro (opcional)")
-    use_lp = st.checkbox("Passa-baixa", False)
-    fc = st.number_input("fc (Hz)", 0.1, 50.0, 1.5, 0.1, disabled=not use_lp)
-    order = st.number_input("Ordem", 2, 8, 4, 1, disabled=not use_lp)
+    st.header("Sinal 1D para discretizar")
+    signal_mode = st.selectbox(
+        "Escolha o sinal",
+        ["Norma (sqrt(x^2+y^2+z^2))", "Eixo X", "Eixo Y", "Eixo Z", "|d(sinal)/dt| (da escolha acima)"],
+        index=0,
+    )
+    base_signal_for_der = st.selectbox(
+        "Se escolher |d/dt|, derivar de:",
+        ["Norma", "X", "Y", "Z"],
+        index=0,
+        help="Só usado quando o modo for |d(sinal)/dt|",
+    )
 
     st.header("Baseline")
-    baseline_s = st.number_input("Janela baseline (s)", 0.05, 20.0, 2.0, 0.1)
+    baseline_s = st.number_input("Janela baseline (s)", 0.05, 30.0, 2.0, 0.1)
     top_m_base = st.number_input("Top-m estados baseline", 1, 5, 1, 1)
 
     st.header("Semi-Markov")
     min_run = st.number_input("min_run (amostras)", 1, 500, 5, 1)
 
-    st.header("Critério de mudança (sequência)")
-    n_base = st.number_input("n_base (consecutivos)", 1, 2000, 5, 1)
-    n_out = st.number_input("n_out (consecutivos)", 1, 2000, 5, 1)
+    st.header("Critério de sequência")
+    n_base = st.number_input("n_base", 1, 2000, 5, 1)
+    n_out = st.number_input("n_out", 1, 2000, 5, 1)
 
     st.header("Discretização")
     method = st.selectbox("Método", ["Quantis (bins)", "K-means"], index=0)
-    Ks = st.multiselect("K (nº estados) para testar", options=list(range(2, 11)), default=[3, 4, 5])
+    Ks = st.multiselect("K para testar", options=list(range(2, 11)), default=[3, 4, 5])
 
     run_btn = st.button("▶ Rodar", type="primary")
 
 # ============================================================
-# LOAD
+# LOAD + PREP DO SINAL 1D
 # ============================================================
 if not file:
     st.info("Envie um arquivo para começar.")
@@ -223,97 +229,128 @@ if not file:
 df = read_table_any(file)
 df.columns = df.columns.str.strip()
 
-if (col_t not in df.columns) or (col_y not in df.columns):
-    st.error(f"Colunas não encontradas. Disponíveis: {list(df.columns)}")
+# tenta auto-detect se o usuário não tiver exatamente igual
+if col_t not in df.columns:
+    auto_t = find_first_existing(df.columns, ["DURACAO", "tempo", "Tempo", "time", "TIME"])
+    if auto_t:
+        col_t = auto_t
+if col_x not in df.columns:
+    auto_x = find_first_existing(df.columns, ["AVL EIXO X", "X", "x", "gyro_x", "gyr_x"])
+    if auto_x:
+        col_x = auto_x
+if col_y not in df.columns:
+    auto_y = find_first_existing(df.columns, ["AVL EIXO Y", "Y", "y", "gyro_y", "gyr_y"])
+    if auto_y:
+        col_y = auto_y
+if col_z not in df.columns:
+    auto_z = find_first_existing(df.columns, ["AVL EIXO Z", "Z", "z", "gyro_z", "gyr_z"])
+    if auto_z:
+        col_z = auto_z
+
+missing = [c for c in [col_t, col_x, col_y, col_z] if c not in df.columns]
+if missing:
+    st.error(f"Colunas ausentes: {missing}. Disponíveis: {list(df.columns)}")
     st.stop()
 
 time_ms = df[col_t].to_numpy(dtype=float)
+x = df[col_x].to_numpy(dtype=float)
 y = df[col_y].to_numpy(dtype=float)
+z = df[col_z].to_numpy(dtype=float)
 
-# tempo em s
 t_s = time_ms / 1000.0
-
-# fs
 dt = np.median(np.diff(t_s))
 if dt <= 0:
     st.error("Tempo inválido (dt<=0).")
     st.stop()
+fs = 1.0 / dt
 
-fs = (1.0 / dt) if infer_fs else float(fs_manual)
+norma = np.sqrt(x*x + y*y + z*z)
 
-# filtro opcional
-y_use = y.copy()
-if use_lp:
-    try:
-        y_use = lowpass(y_use, fs, float(fc), order=int(order))
-    except Exception as e:
-        st.error(f"Erro no filtro: {e}")
-        st.stop()
+# escolhe sinal base
+if signal_mode == "Norma (sqrt(x^2+y^2+z^2))":
+    sig = norma
+    sig_name = "norma"
+elif signal_mode == "Eixo X":
+    sig = x
+    sig_name = "x"
+elif signal_mode == "Eixo Y":
+    sig = y
+    sig_name = "y"
+elif signal_mode == "Eixo Z":
+    sig = z
+    sig_name = "z"
+else:
+    # derivada: pega base escolhida
+    base = {"Norma": norma, "X": x, "Y": y, "Z": z}[base_signal_for_der]
+    sig = np.abs(np.gradient(base, t_s))
+    sig_name = f"abs_d({base_signal_for_der})/dt"
 
-st.caption(f"fs: **{fs:.2f} Hz** | N: **{len(t_s)}**")
+st.caption(f"Arquivo OK | fs≈**{fs:.2f} Hz** | N=**{len(t_s)}** | sinal=**{sig_name}**")
 
 base_mask = t_s <= float(baseline_s)
 if base_mask.sum() < max(10, 2 * int(min_run)):
     st.warning("Poucas amostras na baseline (aumente baseline_s ou reduza min_run).")
 
 if not run_btn:
-    st.pyplot(plot_signal_with_marks(t_s, y_use, np.nan, np.nan, "Prévia do sinal", ylabel=col_y))
+    st.pyplot(plot_signal_with_marks(t_s, sig, np.nan, np.nan, "Prévia do sinal 1D", ylabel=sig_name))
     st.stop()
 
 # ============================================================
-# PROCESSA PARA CADA K
+# RODA PARA CADA K
 # ============================================================
 results = []
-
 tabs = st.tabs([f"K={K}" for K in Ks] + ["📥 Download"])
 
-out = pd.DataFrame({"tempo_ms": time_ms, "t_s": t_s, "y": y_use})
+out = pd.DataFrame(
+    {
+        "tempo_ms": time_ms,
+        "t_s": t_s,
+        "x": x,
+        "y": y,
+        "z": z,
+        "norma": norma,
+        "sig_used": sig,
+    }
+)
 
 for idx_tab, K in enumerate(Ks):
     K = int(K)
 
-    # discretiza
     if method == "Quantis (bins)":
-        states, edges = discretize_quantile_bins(y_use, K)
-        extra = f"edges≈{np.round(edges, 4)}"
+        states, edges = discretize_quantile_bins(sig, K)
+        extra = f"edges≈{np.round(edges, 6)}"
     else:
-        states, centers_sorted = discretize_kmeans_1d(y_use, K)
-        extra = f"centers≈{np.round(centers_sorted, 4)}"
+        states, centers_sorted = discretize_kmeans_1d(sig, K)
+        extra = f"centers≈{np.round(centers_sorted, 6)}"
 
-    # semi-markov (merge)
     states_sm = merge_short_runs(states, int(min_run))
-
-    # baseline states = top-m mais frequentes na janela baseline
     base_states = dominant_states_in_window(states_sm, base_mask, top_m=int(top_m_base))
 
-    # evento onset/offset por sequência
     on, off = detect_seq(states_sm, base_states, int(n_base), int(n_out))
-
-    # matrizes e probabilidades
-    C, P = transition_matrix(states_sm, K)
-    labels = [f"S{i+1}" for i in range(K)]
-    C_df = pd.DataFrame(C, index=labels, columns=labels)
-    P_df = pd.DataFrame(P, index=labels, columns=labels)
-    chg_df = p_change_table(P_df.to_numpy())
-    chg_df.index = labels
-    emp_df = empirical_p_event(states_sm, base_states, int(n_base), int(n_out))
-
-    # resumo
     on_s = idx_to_time(t_s, on)
     off_s = idx_to_time(t_s, off)
     dur = (off_s - on_s) if (on is not None and off is not None) else np.nan
 
-    results.append({
-        "K": K,
-        "baseline_states": ", ".join(map(str, base_states)),
-        "onset_s": on_s,
-        "offset_s": off_s,
-        "dur_s": dur,
-        "n_transitions": int(np.sum(states_sm[1:] != states_sm[:-1])),
-        "extra": extra,
-    })
+    C, P = transition_matrix(states_sm, K)
+    labels = [f"S{i+1}" for i in range(K)]
+    C_df = pd.DataFrame(C, index=labels, columns=labels)
+    P_df = pd.DataFrame(P, index=labels, columns=labels)
+    chg_df = p_change_table(P)
+    chg_df.index = labels
+    emp_df = empirical_p_event(states_sm, base_states, int(n_base), int(n_out))
 
-    # salva no output
+    results.append(
+        {
+            "K": K,
+            "baseline_states": ", ".join(map(str, base_states)),
+            "onset_s": on_s,
+            "offset_s": off_s,
+            "dur_s": dur,
+            "n_transitions": int(np.sum(states_sm[1:] != states_sm[:-1])),
+            "extra": extra,
+        }
+    )
+
     out[f"state_K{K}"] = states_sm
     out[f"onset_K{K}"] = 0
     out[f"offset_K{K}"] = 0
@@ -322,19 +359,18 @@ for idx_tab, K in enumerate(Ks):
     if off is not None:
         out.loc[off, f"offset_K{K}"] = 1
 
-    # UI por K
     with tabs[idx_tab]:
-        st.subheader(f"Discretização: {method} | {extra}")
+        st.subheader(f"{method} | {extra}")
         st.write(
             f"**Baseline states (top-m):** {', '.join(map(str, base_states))}  \n"
             f"**Início:** {on_s:.3f}s | **Fim:** {off_s:.3f}s | **Duração:** {dur:.3f}s"
-            if np.isfinite(on_s) and np.isfinite(off_s) else
-            f"**Baseline states (top-m):** {', '.join(map(str, base_states))}  \n"
-            f"**Início/Fim:** não detectado com (n_base={n_base}, n_out={n_out})"
+            if np.isfinite(on_s) and np.isfinite(off_s)
+            else f"**Baseline states (top-m):** {', '.join(map(str, base_states))}  \n"
+                 f"**Início/Fim:** não detectado com (n_base={n_base}, n_out={n_out})"
         )
 
-        st.pyplot(plot_signal_with_marks(t_s, y_use, on_s, off_s, "Sinal + marcas", ylabel=col_y))
-        st.pyplot(plot_states(t_s, states_sm, K))
+        st.pyplot(plot_signal_with_marks(t_s, sig, on_s, off_s, "Sinal + marcas", ylabel=sig_name))
+        st.pyplot(plot_states(t_s, states_sm, K, title="Estados (semi-Markov)"))
 
         c1, c2, c3 = st.columns([1.6, 1.0, 1.2])
         with c1:
@@ -349,16 +385,13 @@ for idx_tab, K in enumerate(Ks):
             st.caption("Evento por sequência (empírico)")
             st.dataframe(emp_df.round(4), use_container_width=True)
 
-# ============================================================
-# TAB FINAL: resumo e download
-# ============================================================
 with tabs[-1]:
-    st.subheader("Resumo comparativo (todos os K)")
+    st.subheader("Resumo comparativo")
     st.dataframe(pd.DataFrame(results), use_container_width=True)
 
     st.download_button(
-        "📥 Baixar CSV (sinal + estados + onset/offset)",
+        "📥 Baixar CSV (XYZ + sinal + estados + onset/offset)",
         out.to_csv(index=False).encode("utf-8"),
-        file_name="markov_estados_eventos.csv",
+        file_name="markov_xyz_estados_eventos.csv",
         mime="text/csv",
     )
