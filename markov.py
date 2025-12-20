@@ -1,16 +1,31 @@
+# app.py
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt
+
+from scipy.signal import butter, filtfilt, detrend
 from sklearn.cluster import KMeans
 
-st.set_page_config(page_title="iTUG Segmentação: Limiar + Semi-Markov", layout="wide")
-st.title("📱 iTUG: Segmentação por Limiar (amplitude/derivada) e Semi-Markov (K-means + duração)")
+
+st.set_page_config(page_title="iTUG Segmentação: Threshold + Semi-Markov", layout="wide")
+st.title("📱 iTUG: Threshold (amplitude/derivada) + Multi-estados (bins) + Semi-Markov (K-means)")
 
 # -----------------------------
-# Helpers
+# Helpers (IO / preprocess)
 # -----------------------------
+def read_table_any(file) -> pd.DataFrame:
+    """Lê CSV/TXT tentando ; e separador automático."""
+    try:
+        return pd.read_csv(file, sep=";")
+    except Exception:
+        file.seek(0)
+        try:
+            return pd.read_csv(file, sep=None, engine="python")
+        except Exception:
+            file.seek(0)
+            return pd.read_csv(file)
+
 def infer_fs_from_time_ms(time_ms: np.ndarray) -> float:
     dt_ms = np.median(np.diff(time_ms.astype(float)))
     if not np.isfinite(dt_ms) or dt_ms <= 0:
@@ -24,6 +39,70 @@ def lowpass_filter(x: np.ndarray, fs: float, cutoff_hz: float, order: int = 4) -
     b, a = butter(order, wn, btype="low")
     return filtfilt(b, a, x.astype(float))
 
+def resample_to_fs(t_s: np.ndarray, y: np.ndarray, fs_target: float):
+    """Interpolação linear para grade uniforme."""
+    t_s = np.asarray(t_s, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    order = np.argsort(t_s)
+    t_s = t_s[order]
+    y = y[order]
+
+    # remove tempos duplicados
+    uniq = np.diff(t_s, prepend=t_s[0] - 1) > 0
+    t_s = t_s[uniq]
+    y = y[uniq]
+
+    dt = 1.0 / fs_target
+    t_new = np.arange(t_s[0], t_s[-1] + 1e-12, dt)
+    y_new = np.interp(t_new, t_s, y)
+    return t_new, y_new
+
+def preprocess_axes_to_norm(
+    t_ms: np.ndarray,
+    x: np.ndarray, y: np.ndarray, z: np.ndarray,
+    fs_target: float,
+    do_detrend: bool,
+    cutoff_hz: float,
+    filt_order: int
+):
+    """
+    Pipeline:
+    1) tempo (ms) -> t_s
+    2) interpolação para fs_target (100 Hz por padrão)
+    3) detrend (opcional)
+    4) filtro LP 1.5 Hz (ou o que você escolher) em cada eixo
+    5) norma = sqrt(x^2 + y^2 + z^2)
+    """
+    t_s = np.asarray(t_ms, dtype=float) / 1000.0
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    z = np.asarray(z, dtype=float)
+
+    t_s_new, x_i = resample_to_fs(t_s, x, fs_target)
+    _, y_i = resample_to_fs(t_s, y, fs_target)
+    _, z_i = resample_to_fs(t_s, z, fs_target)
+
+    if do_detrend:
+        x_i = detrend(x_i, type="linear")
+        y_i = detrend(y_i, type="linear")
+        z_i = detrend(z_i, type="linear")
+
+    x_f = lowpass_filter(x_i, fs=fs_target, cutoff_hz=cutoff_hz, order=filt_order)
+    y_f = lowpass_filter(y_i, fs=fs_target, cutoff_hz=cutoff_hz, order=filt_order)
+    z_f = lowpass_filter(z_i, fs=fs_target, cutoff_hz=cutoff_hz, order=filt_order)
+
+    norma = np.sqrt(x_f**2 + y_f**2 + z_f**2)
+    dxdt = np.gradient(norma, t_s_new)
+    abs_dxdt = np.abs(dxdt)
+
+    time_ms_new = t_s_new * 1000.0
+    return time_ms_new, t_s_new, norma, abs_dxdt, x_i, y_i, z_i, x_f, y_f, z_f
+
+
+# -----------------------------
+# Helpers (states / semi-markov)
+# -----------------------------
 def runs_from_labels(labels: np.ndarray):
     labels = np.asarray(labels)
     if labels.size == 0:
@@ -38,7 +117,7 @@ def runs_from_labels(labels: np.ndarray):
     return [(s, e, labels[s]) for s, e in zip(starts, ends)]
 
 def merge_short_runs(labels: np.ndarray, min_len: int = 5) -> np.ndarray:
-    """Suavização tipo semi-Markov: funde runs curtos (<min_len) ao vizinho mais longo."""
+    """Funde runs curtos (<min_len) ao vizinho mais longo (suavização tipo semi-Markov)."""
     labels = np.asarray(labels).copy()
     if len(labels) == 0:
         return labels
@@ -54,6 +133,7 @@ def merge_short_runs(labels: np.ndarray, min_len: int = 5) -> np.ndarray:
                 continue
             left = runs[idx - 1] if idx - 1 >= 0 else None
             right = runs[idx + 1] if idx + 1 < len(runs) else None
+
             if left is None and right is None:
                 continue
             if left is None:
@@ -64,6 +144,7 @@ def merge_short_runs(labels: np.ndarray, min_len: int = 5) -> np.ndarray:
                 left_len = left[1] - left[0] + 1
                 right_len = right[1] - right[0] + 1
                 new_lab = left[2] if left_len >= right_len else right[2]
+
             labels[s : e + 1] = new_lab
             changed = True
             break
@@ -75,12 +156,8 @@ def dominant_states_in_window(states: np.ndarray, mask: np.ndarray, top_m: int =
 
 def detect_onset_offset_seq(states: np.ndarray, baseline_states, n_base: int = 5, n_out: int = 5):
     """
-    Critério parametrizável:
-      - onset:  n_base baseline -> n_out não-baseline
-      - offset: n_out não-baseline -> n_base baseline (última ocorrência)
-    Retorna:
-      onset_idx  = 1ª amostra do bloco não-baseline (início atividade)
-      offset_idx = última amostra do bloco não-baseline (fim atividade)
+    onset:  n_base baseline consecutivos -> n_out não-baseline consecutivos
+    offset: n_out não-baseline consecutivos -> n_base baseline consecutivos (última ocorrência)
     """
     states = np.asarray(states)
     baseline_states = set(np.atleast_1d(baseline_states).tolist())
@@ -116,7 +193,7 @@ def p_change_table(P: np.ndarray, labels):
     return pd.DataFrame({"P(permanecer)": diag, "P(mudar)": 1 - diag}, index=labels)
 
 def empirical_p_event(states: np.ndarray, baseline_states, n_base: int, n_out: int) -> pd.DataFrame:
-    """Probabilidade empírica do evento n_base+n_out."""
+    """Probabilidade empírica do evento n_base + n_out."""
     states = np.asarray(states)
     baseline_states = set(np.atleast_1d(baseline_states).tolist())
     is_base = np.isin(states, list(baseline_states))
@@ -125,12 +202,10 @@ def empirical_p_event(states: np.ndarray, baseline_states, n_base: int, n_out: i
 
     opp_on = ev_on = opp_off = ev_off = 0
     for i in range(0, N - win + 1):
-        # onset opp
         if np.all(is_base[i:i+n_base]):
             opp_on += 1
             if np.all(~is_base[i+n_base:i+win]):
                 ev_on += 1
-        # offset opp
         if np.all(~is_base[i:i+n_out]):
             opp_off += 1
             if np.all(is_base[i+n_out:i+win]):
@@ -186,9 +261,12 @@ def state_entropy(P: np.ndarray) -> float:
         Hs.append(float(-np.sum(p * np.log2(p + eps))))
     return float(np.mean(Hs)) if Hs else np.nan
 
-def plot_signal(t_s, x_filt, overlays, title):
+# -----------------------------
+# Plot helpers
+# -----------------------------
+def plot_signal(t_s, y, overlays, title, ylabel="Norma (filtrada)"):
     fig, ax = plt.subplots(figsize=(12, 4.2))
-    ax.plot(t_s, x_filt, label="norma filtrada")
+    ax.plot(t_s, y, label="sinal")
     for name, d in overlays.items():
         on_s = d.get("on_s", np.nan)
         off_s = d.get("off_s", np.nan)
@@ -198,7 +276,7 @@ def plot_signal(t_s, x_filt, overlays, title):
         if np.isfinite(off_s):
             ax.axvline(off_s, linestyle=style, label=f"fim ({name})")
     ax.set_xlabel("Tempo (s)")
-    ax.set_ylabel("Norma (filtrada)")
+    ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.grid(True, which="both")
     ax.legend(loc="upper right")
@@ -218,230 +296,240 @@ def plot_states_band(t_s, states_dict, title):
     ax.legend(loc="upper right")
     return fig
 
-def score_k_method(m, t_s, w_trans, w_ent, w_invalid, w_pseq):
-    """
-    Score maior = melhor.
-    Score = +w_pseq*(P_on + P_off) - w_trans*(#transições) - w_ent*(entropia) - w_invalid*(inválido)
-    """
-    P = m["P_df"].to_numpy(dtype=float)
-    ent = state_entropy(P)
-    trans = n_transitions(m["states"])
-    dur = activity_duration_seconds(t_s, m["on"], m["off"])
-    invalid = 1.0 if (not np.isfinite(dur)) else 0.0
-
-    p_on = float(m["emp_df"]["Probabilidade empírica"].iloc[0])
-    p_off = float(m["emp_df"]["Probabilidade empírica"].iloc[1])
-    p_on = 0.0 if not np.isfinite(p_on) else p_on
-    p_off = 0.0 if not np.isfinite(p_off) else p_off
-
-    ent_pen = 0.0 if not np.isfinite(ent) else ent
-    score = (w_pseq * (p_on + p_off)) - (w_trans * trans) - (w_ent * ent_pen) - (w_invalid * invalid)
-    comps = dict(ent=ent, trans=trans, dur=dur, p_on=p_on, p_off=p_off, invalid=invalid)
-    return score, comps
-
 # -----------------------------
 # Sidebar
 # -----------------------------
 with st.sidebar:
     st.header("Entrada")
-    file = st.file_uploader("Upload CSV", type=["csv"])
+    file = st.file_uploader("Upload CSV/TXT", type=["csv", "txt"])
+
+    st.header("Formato de entrada")
+    input_mode = st.selectbox(
+        "Tipo de arquivo",
+        ["Já tenho norma (tempo + norma)", "Tenho eixos (tempo + X + Y + Z)"],
+        index=1
+    )
 
     st.header("Colunas")
-    col_time = st.text_input("Tempo (ms)", value="tempo")
-    col_norm = st.text_input("Norma", value="norma")
+    if input_mode == "Já tenho norma (tempo + norma)":
+        col_time = st.text_input("Tempo (ms)", value="tempo")
+        col_norm = st.text_input("Norma", value="norma")
+    else:
+        col_time = st.text_input("Tempo (ms)", value="DURACAO")
+        col_x = st.text_input("Eixo X", value="AVL EIXO X")
+        col_y = st.text_input("Eixo Y", value="AVL EIXO Y")
+        col_z = st.text_input("Eixo Z", value="AVL EIXO Z")
 
-    st.header("Pré-processamento")
-    cutoff_hz = st.number_input("Filtro LP (Hz)", 0.1, 20.0, 1.5, 0.1)
+    st.header("Reamostragem / Pré-processamento")
+    target_fs = st.number_input("Frequência alvo (Hz)", 10, 500, 100, 10)
+    do_detr = st.checkbox("Aplicar detrend (remover tendência)", value=True)
+
+    st.header("Filtro")
+    cutoff_hz = st.number_input("Filtro passa-baixa (Hz)", 0.1, 20.0, 1.5, 0.1)
     filt_order = st.number_input("Ordem Butterworth", 2, 8, 4, 1)
+
+    st.header("Baseline e sequência (detecção)")
     baseline_window_s = st.number_input("Janela baseline (s)", 0.2, 10.0, 2.0, 0.1)
 
-    st.header("Semi-Markov hard (limpeza)")
-    run_len = st.number_input("Duração mínima de run (amostras)", 1, 200, 5, 1)
+    st.subheader("Limpeza semi-Markov (runs curtos)")
+    run_len = st.number_input("Duração mínima de run (amostras)", 1, 500, 5, 1)
 
-    st.header("Critério de detecção (sequência)")
-    n_base = st.number_input("Onset: N baseline consecutivos", 1, 500, 5, 1)
-    n_out = st.number_input("Onset: N não-baseline consecutivos", 1, 500, 5, 1)
-    use_diff_for_offset = st.checkbox("Usar critérios diferentes para o FIM (offset)", value=False)
+    st.subheader("Critério de detecção por sequência")
+    n_base = st.number_input("Onset: N baseline consecutivos", 1, 1000, 5, 1)
+    n_out = st.number_input("Onset: N não-baseline consecutivos", 1, 1000, 5, 1)
+    use_diff_for_offset = st.checkbox("Usar critérios diferentes para FIM (offset)", value=False)
     if use_diff_for_offset:
-        n_out_off = st.number_input("Offset: N não-baseline consecutivos", 1, 500, int(n_out), 1)
-        n_base_off = st.number_input("Offset: N baseline consecutivos", 1, 500, int(n_base), 1)
+        n_out_off = st.number_input("Offset: N não-baseline consecutivos", 1, 1000, int(n_out), 1)
+        n_base_off = st.number_input("Offset: N baseline consecutivos", 1, 1000, int(n_base), 1)
     else:
         n_out_off, n_base_off = int(n_out), int(n_base)
 
-    st.header("Limiar (amplitude/derivada)")
-    k_std_amp = st.number_input("k_amp", 0.1, 20.0, 3.0, 0.5)
-    k_std_der = st.number_input("k_der", 0.1, 20.0, 3.0, 0.5)
+    st.header("Threshold (binário)")
+    k_std_amp = st.number_input("k_amp (μ + k·σ)", 0.1, 20.0, 3.0, 0.5)
+    k_std_der = st.number_input("k_der (μ + k·σ)", 0.1, 20.0, 3.0, 0.5)
 
     st.header("Bins (multi-estados)")
-    thr_multistate = st.checkbox("Ativar bins (multi-estados)", value=True)
-    n_bins_thr = st.number_input("K bins (amplitude)", 3, 15, 5, 1)
+    use_bins = st.checkbox("Ativar bins", value=True)
+    n_bins_amp = st.number_input("K bins (amplitude)", 3, 15, 5, 1)
     n_bins_der = st.number_input("K bins (|dx/dt|)", 3, 15, 5, 1)
-    baseline_top_m_thr = st.number_input("Top-m baseline (bins)", 1, 5, 1, 1)
+    baseline_top_m_bins = st.number_input("Top-m baseline (bins)", 1, 5, 1, 1)
 
     st.header("K-means (semi-Markov)")
     ks = st.multiselect("K candidatos", options=[3, 4, 5, 6, 7, 8], default=[4, 5])
     baseline_top_m_km = st.number_input("Top-m baseline (K-means)", 1, 5, 1, 1)
 
     st.header("O que mostrar")
-    show_thr_amp_bin = st.checkbox("Mostrar: limiar amplitude (binário)", value=True)
-    show_thr_der_bin = st.checkbox("Mostrar: limiar derivada (binário)", value=True)
-    show_thr_bins_amp = st.checkbox("Mostrar: bins amplitude", value=True)
-    show_thr_bins_der = st.checkbox("Mostrar: bins |dx/dt|", value=True)
-    show_kmeans = st.checkbox("Mostrar: semi-Markov K-means", value=True)
-
-    st.header("Auto-K (escolher melhor K do K-means)")
-    auto_pick_k = st.checkbox("Ativar auto-K", value=True)
-    st.caption("Score = +w_pseq*(P_on+P_off) - w_trans*(#trans) - w_ent*(entropia) - w_invalid*(inválido)")
-    w_trans = st.number_input("w_trans", 0.0, 5.0, 0.05, 0.01)
-    w_ent = st.number_input("w_ent", 0.0, 5.0, 0.20, 0.05)
-    w_invalid = st.number_input("w_invalid", 0.0, 100.0, 10.0, 1.0)
-    w_pseq = st.number_input("w_pseq", 0.0, 10.0, 2.0, 0.5)
+    show_thr_amp = st.checkbox("Mostrar: threshold amplitude", value=True)
+    show_thr_der = st.checkbox("Mostrar: threshold derivada", value=True)
+    show_bins_amp = st.checkbox("Mostrar: bins amplitude", value=True)
+    show_bins_der = st.checkbox("Mostrar: bins derivada", value=True)
+    show_kmeans = st.checkbox("Mostrar: K-means", value=True)
 
     run_btn = st.button("▶️ Rodar", type="primary")
 
+
 # -----------------------------
-# Load data
+# Load & build (tempo_ms, t_s, norma_filt, abs_dxdt)
 # -----------------------------
 if not file:
-    st.info("Faça upload de um CSV com colunas de tempo (ms) e norma.")
+    st.info("Faça upload de um arquivo CSV/TXT para começar.")
     st.stop()
 
-try:
-    df = pd.read_csv(file)
-except Exception:
-    file.seek(0)
-    df = pd.read_csv(file, sep=None, engine="python")
+df = read_table_any(file)
+df.columns = [c.strip() for c in df.columns]
 
-if col_time not in df.columns or col_norm not in df.columns:
-    st.error(f"Colunas não encontradas. Disponíveis: {list(df.columns)}")
-    st.stop()
+# Pré-processamento conforme modo de entrada
+if input_mode == "Já tenho norma (tempo + norma)":
+    if col_time not in df.columns or col_norm not in df.columns:
+        st.error(f"Colunas não encontradas. Disponíveis: {list(df.columns)}")
+        st.stop()
 
-time_ms = df[col_time].values.astype(float)
-x_raw = df[col_norm].values.astype(float)
+    time_ms = df[col_time].values.astype(float)
+    norma_raw = df[col_norm].values.astype(float)
 
-fs = infer_fs_from_time_ms(time_ms)
-t_s = time_ms / 1000.0
+    fs = infer_fs_from_time_ms(time_ms)
+    t_s = time_ms / 1000.0
 
-x_filt = lowpass_filter(x_raw, fs=fs, cutoff_hz=float(cutoff_hz), order=int(filt_order))
-dxdt = np.gradient(x_filt, t_s)
-abs_dxdt = np.abs(dxdt)
+    norma_filt = lowpass_filter(norma_raw, fs=fs, cutoff_hz=float(cutoff_hz), order=int(filt_order))
+    abs_dxdt = np.abs(np.gradient(norma_filt, t_s))
 
-st.caption(f"fs estimada: **{fs:.2f} Hz** | N: **{len(df)}**")
+    debug_axes = None
+    out_base_cols = {
+        "tempo_ms": time_ms,
+        "t_s": t_s,
+        "norma_raw": norma_raw,
+        "norma_filt": norma_filt,
+        "abs_dxdt": abs_dxdt
+    }
+
+else:
+    for c in [col_time, col_x, col_y, col_z]:
+        if c not in df.columns:
+            st.error(f"Coluna '{c}' não encontrada. Disponíveis: {list(df.columns)}")
+            st.stop()
+
+    time_ms_raw = df[col_time].values.astype(float)
+    x_raw = df[col_x].values.astype(float)
+    y_raw = df[col_y].values.astype(float)
+    z_raw = df[col_z].values.astype(float)
+
+    # interp -> detrend -> LP -> norma
+    time_ms, t_s, norma_filt, abs_dxdt, x_i, y_i, z_i, x_f, y_f, z_f = preprocess_axes_to_norm(
+        t_ms=time_ms_raw,
+        x=x_raw, y=y_raw, z=z_raw,
+        fs_target=float(target_fs),
+        do_detrend=bool(do_detr),
+        cutoff_hz=float(cutoff_hz),
+        filt_order=int(filt_order),
+    )
+    fs = float(target_fs)
+
+    debug_axes = {
+        "t_s": t_s,
+        "x_i": x_i, "y_i": y_i, "z_i": z_i,
+        "x_f": x_f, "y_f": y_f, "z_f": z_f,
+    }
+
+    out_base_cols = {
+        "tempo_ms": time_ms,
+        "t_s": t_s,
+        "x_raw": x_raw,
+        "y_raw": y_raw,
+        "z_raw": z_raw,
+        "x_interp": x_i,
+        "y_interp": y_i,
+        "z_interp": z_i,
+        "x_filt": x_f,
+        "y_filt": y_f,
+        "z_filt": z_f,
+        "norma_filt": norma_filt,
+        "abs_dxdt": abs_dxdt
+    }
+
+st.caption(f"fs usada: **{fs:.2f} Hz** | N: **{len(t_s)}**")
 
 base_mask = t_s <= float(baseline_window_s)
 if base_mask.sum() < max(10, 2 * int(run_len)):
     st.warning("Poucas amostras na baseline. Considere aumentar a janela baseline.")
 
 if not run_btn:
-    st.pyplot(plot_signal(t_s, x_filt, overlays={}, title="Pré-visualização: norma filtrada"))
+    st.pyplot(plot_signal(t_s, norma_filt, overlays={}, title="Pré-visualização: norma filtrada"))
+    if debug_axes is not None:
+        st.info("Você está no modo eixos: rode para ver segmentações. (Você pode também checar os eixos em um gráfico depois.)")
     st.stop()
 
+
 # -----------------------------
-# Run methods
+# Métodos
 # -----------------------------
 methods = {}
 
-def compute_emp_df(states, base_states, nb, no):
-    return empirical_p_event(states, base_states, n_base=nb, n_out=no)
+def compute_on_off(states_sm, base_states):
+    on, _ = detect_onset_offset_seq(states_sm, base_states, n_base=int(n_base), n_out=int(n_out))
+    _, off = detect_onset_offset_seq(states_sm, base_states, n_base=int(n_base_off), n_out=int(n_out_off))
+    return on, off
 
-# Threshold amplitude (binary)
-mu0 = x_filt[base_mask].mean()
-sd0 = x_filt[base_mask].std(ddof=0) + 1e-12
+def add_method(key, label, states_sm, K, base_states):
+    _, P = transition_matrix(states_sm, K)
+    labels = [f"S{i+1}" for i in range(K)]
+    methods[key] = dict(
+        label=label,
+        states=states_sm,
+        K=K,
+        baseline_states=np.atleast_1d(base_states),
+        on=None,
+        off=None,
+        P_df=pd.DataFrame(P, index=labels, columns=labels),
+        chg_df=p_change_table(P, labels),
+        emp_df=empirical_p_event(states_sm, base_states, int(n_base), int(n_out)),
+    )
+    on, off = compute_on_off(states_sm, base_states)
+    methods[key]["on"] = on
+    methods[key]["off"] = off
+
+# Threshold amplitude (binário)
+mu0 = norma_filt[base_mask].mean()
+sd0 = norma_filt[base_mask].std(ddof=0) + 1e-12
 thr_amp = mu0 + float(k_std_amp) * sd0
-st_amp_bin = (x_filt > thr_amp).astype(int)
-st_amp_bin_sm = merge_short_runs(st_amp_bin, min_len=int(run_len))
+st_amp = (norma_filt > thr_amp).astype(int)
+st_amp_sm = merge_short_runs(st_amp, min_len=int(run_len))
+add_method("thr_amp_bin", "Threshold amplitude (binário)", st_amp_sm, 2, base_states=[0])
 
-on_amp_bin, _ = detect_onset_offset_seq(st_amp_bin_sm, baseline_states=[0], n_base=int(n_base), n_out=int(n_out))
-_, off_amp_bin = detect_onset_offset_seq(st_amp_bin_sm, baseline_states=[0], n_base=int(n_base_off), n_out=int(n_out_off))
-
-_, P = transition_matrix(st_amp_bin_sm, 2)
-labels2 = ["Rest(0)", "Active(1)"]
-methods["thr_amp_bin"] = dict(
-    label="Limiar amplitude (binário)",
-    states=st_amp_bin_sm, K=2,
-    baseline_states=np.array([0]),
-    on=on_amp_bin, off=off_amp_bin,
-    P_df=pd.DataFrame(P, index=labels2, columns=labels2),
-    chg_df=p_change_table(P, labels2),
-    emp_df=compute_emp_df(st_amp_bin_sm, [0], int(n_base), int(n_out)),
-)
-
-# Threshold derivative (binary)
+# Threshold derivada (binário)
 muD = abs_dxdt[base_mask].mean()
 sdD = abs_dxdt[base_mask].std(ddof=0) + 1e-12
 thr_der = muD + float(k_std_der) * sdD
-st_der_bin = (abs_dxdt > thr_der).astype(int)
-st_der_bin_sm = merge_short_runs(st_der_bin, min_len=int(run_len))
+st_der = (abs_dxdt > thr_der).astype(int)
+st_der_sm = merge_short_runs(st_der, min_len=int(run_len))
+add_method("thr_der_bin", "Threshold derivada |dx/dt| (binário)", st_der_sm, 2, base_states=[0])
 
-on_der_bin, _ = detect_onset_offset_seq(st_der_bin_sm, baseline_states=[0], n_base=int(n_base), n_out=int(n_out))
-_, off_der_bin = detect_onset_offset_seq(st_der_bin_sm, baseline_states=[0], n_base=int(n_base_off), n_out=int(n_out_off))
-
-_, P = transition_matrix(st_der_bin_sm, 2)
-methods["thr_der_bin"] = dict(
-    label="Limiar derivada |dx/dt| (binário)",
-    states=st_der_bin_sm, K=2,
-    baseline_states=np.array([0]),
-    on=on_der_bin, off=off_der_bin,
-    P_df=pd.DataFrame(P, index=labels2, columns=labels2),
-    chg_df=p_change_table(P, labels2),
-    emp_df=compute_emp_df(st_der_bin_sm, [0], int(n_base), int(n_out)),
-)
-
-# Multi-state bins
-if thr_multistate:
+# Bins (multi-estados)
+if use_bins:
     # amplitude bins
-    Kb = int(n_bins_thr)
-    st_amp_bins, _ = discretize_bins(x_filt, Kb)
-    st_amp_bins_sm = merge_short_runs(st_amp_bins, min_len=int(run_len))
-    base_states_amp = dominant_states_in_window(st_amp_bins_sm, base_mask, top_m=int(baseline_top_m_thr))
-
-    on_amp_bins, _ = detect_onset_offset_seq(st_amp_bins_sm, base_states_amp, n_base=int(n_base), n_out=int(n_out))
-    _, off_amp_bins = detect_onset_offset_seq(st_amp_bins_sm, base_states_amp, n_base=int(n_base_off), n_out=int(n_out_off))
-
-    _, P = transition_matrix(st_amp_bins_sm, Kb)
-    labelsKb = [f"S{k+1}" for k in range(Kb)]
-    methods["thr_amp_bins"] = dict(
-        label=f"Bins amplitude (K={Kb})",
-        states=st_amp_bins_sm, K=Kb,
-        baseline_states=base_states_amp,
-        on=on_amp_bins, off=off_amp_bins,
-        P_df=pd.DataFrame(P, index=labelsKb, columns=labelsKb),
-        chg_df=p_change_table(P, labelsKb),
-        emp_df=compute_emp_df(st_amp_bins_sm, base_states_amp, int(n_base), int(n_out)),
-    )
+    Kb = int(n_bins_amp)
+    st_bins_amp, _ = discretize_bins(norma_filt, Kb)
+    st_bins_amp_sm = merge_short_runs(st_bins_amp, min_len=int(run_len))
+    base_states_amp = dominant_states_in_window(st_bins_amp_sm, base_mask, top_m=int(baseline_top_m_bins))
+    add_method("bins_amp", f"Bins amplitude (K={Kb})", st_bins_amp_sm, Kb, base_states=base_states_amp)
 
     # derivative bins
     Kd = int(n_bins_der)
-    st_der_bins, _ = discretize_bins(abs_dxdt, Kd)
-    st_der_bins_sm = merge_short_runs(st_der_bins, min_len=int(run_len))
-    base_states_der = dominant_states_in_window(st_der_bins_sm, base_mask, top_m=int(baseline_top_m_thr))
-
-    on_der_bins, _ = detect_onset_offset_seq(st_der_bins_sm, base_states_der, n_base=int(n_base), n_out=int(n_out))
-    _, off_der_bins = detect_onset_offset_seq(st_der_bins_sm, base_states_der, n_base=int(n_base_off), n_out=int(n_out_off))
-
-    _, P = transition_matrix(st_der_bins_sm, Kd)
-    labelsKd = [f"S{k+1}" for k in range(Kd)]
-    methods["thr_der_bins"] = dict(
-        label=f"Bins |dx/dt| (K={Kd})",
-        states=st_der_bins_sm, K=Kd,
-        baseline_states=base_states_der,
-        on=on_der_bins, off=off_der_bins,
-        P_df=pd.DataFrame(P, index=labelsKd, columns=labelsKd),
-        chg_df=p_change_table(P, labelsKd),
-        emp_df=compute_emp_df(st_der_bins_sm, base_states_der, int(n_base), int(n_out)),
-    )
+    st_bins_der, _ = discretize_bins(abs_dxdt, Kd)
+    st_bins_der_sm = merge_short_runs(st_bins_der, min_len=int(run_len))
+    base_states_der = dominant_states_in_window(st_bins_der_sm, base_mask, top_m=int(baseline_top_m_bins))
+    add_method("bins_der", f"Bins |dx/dt| (K={Kd})", st_bins_der_sm, Kd, base_states=base_states_der)
 
 # K-means semi-Markov
 kmeans_keys = []
 if ks:
-    x_z = (x_filt - x_filt.mean()) / (x_filt.std(ddof=0) + 1e-12)
+    z = (norma_filt - norma_filt.mean()) / (norma_filt.std(ddof=0) + 1e-12)
     for K in ks:
         K = int(K)
         km = KMeans(n_clusters=K, n_init=20, random_state=7)
-        lab = km.fit_predict(x_z.reshape(-1, 1))
+        lab = km.fit_predict(z.reshape(-1, 1))
 
         centers = km.cluster_centers_.flatten()
-        order = np.argsort(centers)
+        order = np.argsort(centers)  # garante S1 < S2 < ...
         inv = np.zeros_like(order)
         inv[order] = np.arange(K)
         states = inv[lab]
@@ -449,69 +537,33 @@ if ks:
         states_sm = merge_short_runs(states, min_len=int(run_len))
         base_states = dominant_states_in_window(states_sm, base_mask, top_m=int(baseline_top_m_km))
 
-        on_i, _ = detect_onset_offset_seq(states_sm, base_states, n_base=int(n_base), n_out=int(n_out))
-        _, off_i = detect_onset_offset_seq(states_sm, base_states, n_base=int(n_base_off), n_out=int(n_out_off))
-
-        _, P = transition_matrix(states_sm, n_states=K)
-        labelsK = [f"S{k+1}" for k in range(K)]
         key = f"semi_kmeans_K{K}"
         kmeans_keys.append(key)
-        methods[key] = dict(
-            label=f"Semi-Markov K-means (K={K})",
-            states=states_sm, K=K,
-            baseline_states=base_states,
-            on=on_i, off=off_i,
-            P_df=pd.DataFrame(P, index=labelsK, columns=labelsK),
-            chg_df=p_change_table(P, labelsK),
-            emp_df=compute_emp_df(states_sm, base_states, int(n_base), int(n_out)),
-        )
+        add_method(key, f"Semi-Markov K-means (K={K})", states_sm, K, base_states=base_states)
 
-# Auto-K ranking (only among kmeans)
-score_df = None
-if auto_pick_k and kmeans_keys:
-    score_rows = []
-    for key in kmeans_keys:
-        m = methods[key]
-        sc, comps = score_k_method(m, t_s, float(w_trans), float(w_ent), float(w_invalid), float(w_pseq))
-        score_rows.append({
-            "Método": m["label"],
-            "Score": sc,
-            "K": m["K"],
-            "Entropia": comps["ent"],
-            "#transições": comps["trans"],
-            "Duração(s)": comps["dur"],
-            "P_on(seq)": comps["p_on"],
-            "P_off(seq)": comps["p_off"],
-            "Inválido": comps["invalid"],
-        })
-    score_df = pd.DataFrame(score_rows).sort_values("Score", ascending=False)
 
 # -----------------------------
-# Display filtering
+# O que mostrar
 # -----------------------------
 display_keys = []
-if show_thr_amp_bin and "thr_amp_bin" in methods:
+if show_thr_amp:
     display_keys.append("thr_amp_bin")
-if show_thr_der_bin and "thr_der_bin" in methods:
+if show_thr_der:
     display_keys.append("thr_der_bin")
-if thr_multistate and show_thr_bins_amp and "thr_amp_bins" in methods:
-    display_keys.append("thr_amp_bins")
-if thr_multistate and show_thr_bins_der and "thr_der_bins" in methods:
-    display_keys.append("thr_der_bins")
+if use_bins and show_bins_amp and "bins_amp" in methods:
+    display_keys.append("bins_amp")
+if use_bins and show_bins_der and "bins_der" in methods:
+    display_keys.append("bins_der")
 if show_kmeans:
     display_keys += [k for k in methods.keys() if k.startswith("semi_kmeans_K")]
+
 display_keys = [k for k in display_keys if k in methods]
 
+
 # -----------------------------
-# Register for download
+# Registro para download
 # -----------------------------
-out = pd.DataFrame({
-    "tempo_ms": time_ms,
-    "t_s": t_s,
-    "norma_raw": x_raw,
-    "norma_filt": x_filt,
-    "abs_dxdt": abs_dxdt,
-})
+out = pd.DataFrame(out_base_cols)
 for key, m in methods.items():
     out[f"state_{key}"] = m["states"]
     out[f"onset_{key}"] = 0
@@ -521,12 +573,33 @@ for key, m in methods.items():
     if m["off"] is not None:
         out.loc[m["off"], f"offset_{key}"] = 1
 
+
 # -----------------------------
 # Tabs
 # -----------------------------
-tab1, tab2, tab3, tab4 = st.tabs(["📈 Segmentação", "📊 Probabilidades", "🧮 Comparação", "🤖 Auto-K"])
+tab0, tab1, tab2, tab3 = st.tabs(["🧪 Pré-processamento", "📈 Segmentação", "📊 Probabilidades", "🧮 Comparação"])
+
+with tab0:
+    st.subheader("Checagem do pré-processamento")
+    st.write(
+        f"- fs final: **{fs:.2f} Hz** | LP: **{cutoff_hz:.2f} Hz** | detrend: **{do_detr}** | alvo: **{target_fs} Hz** (se modo eixos)"
+    )
+    st.pyplot(plot_signal(t_s, norma_filt, overlays={}, title="Norma filtrada (pronta para segmentação)"))
+
+    if debug_axes is not None:
+        fig, ax = plt.subplots(figsize=(12, 3.8))
+        ax.plot(debug_axes["t_s"], debug_axes["x_f"], label="X filtrado")
+        ax.plot(debug_axes["t_s"], debug_axes["y_f"], label="Y filtrado")
+        ax.plot(debug_axes["t_s"], debug_axes["z_f"], label="Z filtrado")
+        ax.set_title("Eixos filtrados (após interp + detrend + LP)")
+        ax.set_xlabel("Tempo (s)")
+        ax.set_ylabel("Unidade do sensor")
+        ax.grid(True, which="both")
+        ax.legend(loc="upper right")
+        st.pyplot(fig)
 
 with tab1:
+    st.subheader("Resumo (métodos selecionados)")
     rows = []
     for key in display_keys:
         m = methods[key]
@@ -539,7 +612,6 @@ with tab1:
             "Duração (s)": activity_duration_seconds(t_s, m["on"], m["off"]),
             "#transições": n_transitions(m["states"]),
         })
-    st.subheader("Resumo (métodos selecionados)")
     st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     overlays = {}
@@ -548,18 +620,16 @@ with tab1:
         overlays[m["label"]] = dict(
             on_s=idx_to_time(t_s, m["on"]),
             off_s=idx_to_time(t_s, m["off"]),
-            style="--" if "Limiar" in m["label"] else ":",
+            style="--" if "Threshold" in m["label"] else ":",
         )
-    st.pyplot(plot_signal(t_s, x_filt, overlays, "Norma filtrada + onset/offset (métodos selecionados)"))
+
+    st.pyplot(plot_signal(t_s, norma_filt, overlays, "Norma filtrada + onset/offset (métodos selecionados)"))
 
     states_for_band = {methods[k]["label"]: {"states": methods[k]["states"], "K": methods[k]["K"]} for k in display_keys}
-    st.pyplot(plot_states_band(t_s, states_for_band, "Sequência de estados (normalizada)"))
+    st.pyplot(plot_states_band(t_s, states_for_band, "Sequência de estados (normalizada) — comparação visual"))
 
     with st.expander("Parâmetros usados"):
         st.write({
-            "fs_Hz": float(fs),
-            "cutoff_hz": float(cutoff_hz),
-            "filt_order": int(filt_order),
             "baseline_window_s": float(baseline_window_s),
             "run_len (limpeza runs)": int(run_len),
             "onset n_base": int(n_base),
@@ -568,6 +638,11 @@ with tab1:
             "offset n_base": int(n_base_off),
             "k_std_amp": float(k_std_amp),
             "k_std_der": float(k_std_der),
+            "bins_K_amp": int(n_bins_amp),
+            "bins_K_der": int(n_bins_der),
+            "bins_top_m_baseline": int(baseline_top_m_bins),
+            "kmeans_Ks": ks,
+            "kmeans_top_m_baseline": int(baseline_top_m_km),
         })
 
 with tab2:
@@ -575,7 +650,7 @@ with tab2:
     for key in display_keys:
         m = methods[key]
         st.markdown(f"### {m['label']}")
-        c1, c2, c3 = st.columns([1.4, 1.0, 1.2])
+        c1, c2, c3 = st.columns([1.4, 1.0, 1.3])
         with c1:
             st.caption("Matriz de transição (1 passo)")
             st.dataframe(m["P_df"].round(3), use_container_width=True)
@@ -583,7 +658,7 @@ with tab2:
             st.caption("P(mudar) por estado")
             st.dataframe(m["chg_df"].round(3), use_container_width=True)
         with c3:
-            st.caption("Probabilidade empírica do evento por sequência")
+            st.caption("Evento por sequência (sustentado)")
             st.dataframe(m["emp_df"].round(4), use_container_width=True)
 
 with tab3:
@@ -603,20 +678,11 @@ with tab3:
         })
     st.dataframe(pd.DataFrame(metrics), use_container_width=True)
 
-with tab4:
-    st.write("Auto-K considera apenas os métodos **Semi-Markov K-means**.")
-    if score_df is None or score_df.empty:
-        st.info("Ative K-means e escolha pelo menos um K para usar auto-K.")
-    else:
-        st.subheader("Ranking por score (maior = melhor)")
-        st.dataframe(score_df, use_container_width=True)
-        best = score_df.iloc[0]
-        st.success(f"✅ Melhor K: **K={int(best['K'])}** | {best['Método']}")
 
 # -----------------------------
 # Download
 # -----------------------------
-st.subheader("📥 Download do registro (estados e marcadores)")
+st.subheader("📥 Download do registro (pré-processado + estados + marcadores)")
 csv_bytes = out.to_csv(index=False).encode("utf-8")
 st.download_button(
     "Baixar CSV",
