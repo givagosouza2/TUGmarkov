@@ -1,7 +1,12 @@
-# markov_xyz_preprocess_peaks.py
-# Streamlit app: preprocess (interp 100 Hz + detrend + LP 1.5 Hz) + states (K-means/quantis)
-# + onset/offset global + 2 maiores picos entre onset..offset
-# + delimitação de cada componente (início/fim) via busca retrógrada/anterógrada até baseline (estados Markov)
+# markov_xyz_preprocess_peaks_endbaseline.py
+# Streamlit app:
+#  - preprocess: interp 100 Hz + detrend + LP 1.5 Hz
+#  - discretize states: K-means (ordered) or quantile bins
+#  - semi-Markov smoothing: merge short runs
+#  - global onset: baseline states from START window
+#  - global offset: baseline states from END window (dominant at the end)
+#  - 2 largest peaks within [onset..offset]
+#  - component bounds for each peak: retro/antero search for baseline (states) with run length n_base
 
 import numpy as np
 import pandas as pd
@@ -14,8 +19,8 @@ from scipy.signal import butter, filtfilt, detrend, find_peaks
 # ============================================================
 # PAGE
 # ============================================================
-st.set_page_config(page_title="Markov – Transientes por picos", layout="wide")
-st.title("📌 Markov / Semi-Markov — 2 transientes (picos) + limites por baseline")
+st.set_page_config(page_title="Markov – Transientes + baseline do fim", layout="wide")
+st.title("📌 Markov / Semi-Markov — 2 transientes (picos) + offset pela baseline do fim")
 
 # ============================================================
 # IO
@@ -55,7 +60,6 @@ def resample_xyz(t_s, x, y, z, fs_target):
     t_s = t_s[idx]
     x, y, z = x[idx], y[idx], z[idx]
 
-    # remove tempos duplicados
     keep = np.diff(t_s, prepend=t_s[0] - 1) > 0
     t_s = t_s[keep]
     x, y, z = x[keep], y[keep], z[keep]
@@ -70,19 +74,14 @@ def resample_xyz(t_s, x, y, z, fs_target):
     return t_new, x_new, y_new, z_new
 
 def preprocess_xyz(t_ms, x, y, z, fs_target=100.0, do_detrend=True, fc=1.5, order=4):
-    # tempo ms -> s
     t_s_raw = np.asarray(t_ms, dtype=float) / 1000.0
-
-    # interp para fs_target
     t_s, x_i, y_i, z_i = resample_xyz(t_s_raw, x, y, z, float(fs_target))
 
-    # detrend
     if do_detrend:
         x_i = detrend(x_i, type="linear")
         y_i = detrend(y_i, type="linear")
         z_i = detrend(z_i, type="linear")
 
-    # lowpass
     x_f = lowpass(x_i, float(fs_target), float(fc), order=int(order))
     y_f = lowpass(y_i, float(fs_target), float(fc), order=int(order))
     z_f = lowpass(z_i, float(fs_target), float(fc), order=int(order))
@@ -102,7 +101,6 @@ def preprocess_xyz(t_ms, x, y, z, fs_target=100.0, do_detrend=True, fc=1.5, orde
 # SEMI-MARKOV / MARKOV HELPERS
 # ============================================================
 def merge_short_runs(states, min_len):
-    """Funde runs curtos (<min_len) no vizinho (semi-Markov hard)."""
     states = np.asarray(states).copy()
     changed = True
     while changed:
@@ -165,7 +163,6 @@ def detect_seq(states, base_states, n_base, n_out):
     return onset, offset
 
 def empirical_p_event(states, base_states, n_base, n_out):
-    """Probabilidade empírica do padrão onset/offset por janelas."""
     states = np.asarray(states)
     base_states = set(np.atleast_1d(base_states).tolist())
     is_base = np.isin(states, list(base_states))
@@ -195,11 +192,31 @@ def empirical_p_event(states, base_states, n_base, n_out):
         index=[f"Onset: base({n_base})→out({n_out})", f"Offset: out({n_out})→base({n_base})"],
     )
 
+def detect_offset_after_onset(states, base_states_end, onset_idx, n_base, n_out):
+    """
+    Procura offset (retorno para baseline do fim) APENAS após onset_idx.
+    Offset definido como: n_out fora da baseline_end seguidos de n_base na baseline_end.
+    Retorna último offset encontrado.
+    """
+    states = np.asarray(states)
+    base_states_end = np.atleast_1d(base_states_end)
+    is_base_end = np.isin(states, base_states_end)
+
+    N = len(states)
+    win = int(n_out) + int(n_base)
+    start = max(0, int(onset_idx) - 1) if onset_idx is not None else 0
+
+    offset = None
+    for i in range(start, N - win + 1):
+        if (~is_base_end[i : i + n_out]).all() and is_base_end[i + n_out : i + win].all():
+            offset = i + n_out - 1
+
+    return offset
+
 # ============================================================
 # DISCRETIZAÇÃO (estados)
 # ============================================================
 def discretize_quantile_bins(x, K):
-    """K estados por quantis (0..K-1)."""
     x = np.asarray(x, dtype=float)
     qs = np.linspace(0, 1, K + 1)
     edges = np.unique(np.quantile(x, qs))
@@ -209,14 +226,13 @@ def discretize_quantile_bins(x, K):
     return s, edges
 
 def discretize_kmeans_1d(x, K, random_state=7):
-    """K-means em 1D, reordenando estados por centro (S1 < S2 < ...)."""
     x = np.asarray(x, dtype=float)
     z = (x - np.mean(x)) / (np.std(x, ddof=0) + 1e-12)
     km = KMeans(n_clusters=K, n_init=20, random_state=random_state)
     lab = km.fit_predict(z.reshape(-1, 1))
 
     centers = km.cluster_centers_.flatten()
-    order = np.argsort(centers)  # do menor centro para o maior
+    order = np.argsort(centers)
     inv = np.zeros_like(order)
     inv[order] = np.arange(K)
     states = inv[lab]
@@ -226,11 +242,6 @@ def discretize_kmeans_1d(x, K, random_state=7):
 # Picos + limites dos componentes via baseline (Markov)
 # ============================================================
 def two_largest_peaks(y, i0, i1, fs, min_dist_s=0.30, prominence=None):
-    """
-    Retorna índices dos 2 maiores picos (por altura) no intervalo [i0, i1].
-    min_dist_s controla distância mínima entre picos.
-    prominence (opcional) filtra picos pequenos.
-    """
     if i0 is None or i1 is None or i1 <= i0 + 3:
         return []
 
@@ -242,14 +253,13 @@ def two_largest_peaks(y, i0, i1, fs, min_dist_s=0.30, prominence=None):
         return []
 
     heights = seg[peaks]
-    order = np.argsort(heights)[::-1]  # maiores primeiro
+    order = np.argsort(heights)[::-1]
     top = peaks[order[:2]]
     top_abs = (top + i0).tolist()
-    top_abs.sort()  # no tempo
+    top_abs.sort()
     return top_abs
 
 def find_baseline_run_backward(is_base, start_idx, n_base):
-    """Procura para trás run baseline (n_base) terminando em j."""
     j = int(start_idx)
     n_base = int(n_base)
     while j >= n_base - 1:
@@ -259,7 +269,6 @@ def find_baseline_run_backward(is_base, start_idx, n_base):
     return None
 
 def find_baseline_run_forward(is_base, start_idx, n_base):
-    """Procura para frente run baseline (n_base) começando em j."""
     N = len(is_base)
     j = int(start_idx)
     n_base = int(n_base)
@@ -270,12 +279,6 @@ def find_baseline_run_forward(is_base, start_idx, n_base):
     return None
 
 def component_bounds_from_peak(states_sm, base_states, peak_idx, n_base=5, clamp=(None, None)):
-    """
-    A partir de um pico, busca retrógrada/anterógrada por retorno à baseline.
-    start_idx: primeiro índice após uma run baseline (n_base) antes do pico
-    end_idx: último índice antes de uma run baseline (n_base) após o pico
-    clamp=(i0,i1) restringe a busca.
-    """
     states_sm = np.asarray(states_sm)
     base_states = np.atleast_1d(base_states)
     is_base = np.isin(states_sm, base_states)
@@ -323,24 +326,20 @@ def plot_states(t_s, states, K, title="Estados (normalizados)"):
     return fig
 
 def plot_signal_marks_components(t_s, y, onset_idx, offset_idx, peaks, comps, title, ylabel):
-    """
-    peaks: [p1, p2] (índices)
-    comps: [(s1,e1,p1),(s2,e2,p2)] com índices
-    """
     fig, ax = plt.subplots(figsize=(12, 4.2))
     ax.plot(t_s, y, linewidth=1, label="sinal")
 
     if onset_idx is not None:
-        ax.axvline(t_s[onset_idx], linestyle="--",color = "black", label="início global")
+        ax.axvline(t_s[onset_idx], linestyle="--", label="início global")
     if offset_idx is not None:
-        ax.axvline(t_s[offset_idx], linestyle="--", color = "black", label="fim global")
+        ax.axvline(t_s[offset_idx], linestyle="--", label="fim global")
 
     for i, p in enumerate(peaks, start=1):
-        ax.axvline(t_s[p], linestyle=":", linewidth=1.2, color = "red", label=f"pico {i}")
+        ax.axvline(t_s[p], linestyle=":", linewidth=1.2, label=f"pico {i}")
 
     for i, (s, e, _p) in enumerate(comps, start=1):
-        ax.axvline(t_s[s], linestyle="-.", linewidth=1.2, color = "red", label=f"comp{i} início")
-        ax.axvline(t_s[e], linestyle="-.", linewidth=1.2, color = "red", label=f"comp{i} fim")
+        ax.axvline(t_s[s], linestyle="-.", linewidth=1.2, label=f"comp{i} início")
+        ax.axvline(t_s[e], linestyle="-.", linewidth=1.2, label=f"comp{i} fim")
 
     ax.set_title(title)
     ax.set_xlabel("Tempo (s)")
@@ -362,7 +361,7 @@ with st.sidebar:
     col_y = st.text_input("Eixo Y", "AVL EIXO Y")
     col_z = st.text_input("Eixo Z", "AVL EIXO Z")
 
-    st.header("Pré-processamento (igual ao pipeline original)")
+    st.header("Pré-processamento (pipeline original)")
     fs_target = st.number_input("Reamostragem (Hz)", 20, 500, 100, 10)
     do_detr = st.checkbox("Detrend (linear)", True)
     fc = st.number_input("Passa-baixa (Hz)", 0.1, 20.0, 1.5, 0.1)
@@ -372,13 +371,18 @@ with st.sidebar:
     sig_choice = st.selectbox("Escolha", ["Norma", "Eixo X", "Eixo Y", "Eixo Z"], index=0)
     use_abs_der = st.checkbox("Usar |d(sinal)/dt|", False)
 
-    st.header("Baseline / Semi-Markov / Sequência global")
-    baseline_s = st.number_input("Janela baseline (s)", 0.05, 30.0, 2.0, 0.1)
-    top_m_base = st.number_input("Top-m estados baseline", 1, 5, 1, 1)
+    st.header("Baseline do início (onset)")
+    baseline_s = st.number_input("Janela baseline início (s)", 0.05, 30.0, 2.0, 0.1)
+    top_m_base = st.number_input("Top-m estados (início)", 1, 5, 1, 1)
 
+    st.header("Baseline do fim (offset)")
+    end_baseline_s = st.number_input("Janela baseline fim (s)", 0.05, 30.0, 2.0, 0.1)
+    top_m_end = st.number_input("Top-m estados (fim)", 1, 5, 1, 1)
+
+    st.header("Semi-Markov + sequência global")
     min_run = st.number_input("min_run (amostras)", 1, 500, 5, 1)
-    n_base = st.number_input("n_base (consecutivos baseline)", 1, 2000, 5, 1)
-    n_out = st.number_input("n_out (consecutivos fora baseline)", 1, 2000, 5, 1)
+    n_base = st.number_input("n_base (baseline consecutivos)", 1, 2000, 5, 1)
+    n_out = st.number_input("n_out (fora baseline consecutivos)", 1, 2000, 5, 1)
 
     st.header("Discretização")
     method = st.selectbox("Método", ["Quantis (bins)", "K-means"], index=1)
@@ -473,18 +477,27 @@ st.caption(
     f"| fs_final=**{fs:.2f}Hz** | N=**{len(t_s)}** | sinal=**{sig_name}**"
 )
 
-base_mask = t_s <= float(baseline_s)
-if base_mask.sum() < max(10, 2 * int(min_run)):
-    st.warning("Poucas amostras na baseline (aumente baseline_s ou reduza min_run).")
+# masks baseline
+base_mask_start = t_s <= float(baseline_s)
+t_end0 = t_s[-1] - float(end_baseline_s)
+base_mask_end = t_s >= t_end0
+
+if base_mask_start.sum() < max(10, 2 * int(min_run)):
+    st.warning("Poucas amostras na baseline do início (aumente baseline_s ou reduza min_run).")
+if base_mask_end.sum() < max(10, 2 * int(min_run)):
+    st.warning("Poucas amostras na baseline do fim (aumente end_baseline_s ou reduza min_run).")
 
 # prévia
 if not run_btn:
     fig, ax = plt.subplots(figsize=(12, 4.0))
     ax.plot(t_s, sig, linewidth=1)
-    ax.set_title("Prévia do sinal 1D (após preprocess)")
+    ax.axvline(float(baseline_s), linestyle=":", label="fim baseline início")
+    ax.axvline(float(t_end0), linestyle=":", label="início baseline fim")
+    ax.set_title("Prévia do sinal 1D (após preprocess) + janelas baseline")
     ax.set_xlabel("Tempo (s)")
     ax.set_ylabel(sig_name)
     ax.grid(True, which="both")
+    ax.legend(loc="upper right")
     st.pyplot(fig)
     st.stop()
 
@@ -520,11 +533,16 @@ for idx_tab, K in enumerate(Ks):
     # semi-markov
     states_sm = merge_short_runs(states, int(min_run))
 
-    # baseline states (top-m)
-    base_states = dominant_states_in_window(states_sm, base_mask, top_m=int(top_m_base))
+    # baseline states: início e fim
+    base_states_start = dominant_states_in_window(states_sm, base_mask_start, top_m=int(top_m_base))
+    base_states_end = dominant_states_in_window(states_sm, base_mask_end, top_m=int(top_m_end))
 
-    # onset/offset global (sequência)
-    on, off = detect_seq(states_sm, base_states, int(n_base), int(n_out))
+    # onset usando baseline do início
+    on, _ = detect_seq(states_sm, base_states_start, int(n_base), int(n_out))
+
+    # offset usando baseline do fim (somente após onset)
+    off = detect_offset_after_onset(states_sm, base_states_end, on, int(n_base), int(n_out))
+
     on_s = idx_to_time(t_s, on)
     off_s = idx_to_time(t_s, off)
     dur_s = (off_s - on_s) if (on is not None and off is not None) else np.nan
@@ -547,14 +565,13 @@ for idx_tab, K in enumerate(Ks):
         for p in peaks:
             s_i, e_i = component_bounds_from_peak(
                 states_sm=states_sm,
-                base_states=base_states,
+                base_states=base_states_start,   # usa baseline do início como "repouso" local do componente
                 peak_idx=p,
-                n_base=int(n_base),      # run baseline exigida (igual ao seu critério)
-                clamp=(on, off)
+                n_base=int(n_base),
+                clamp=(on, off),
             )
             comps.append((s_i, e_i, p))
 
-        # garante ordem temporal dos componentes
         comps.sort(key=lambda x: x[2])
 
     # matrizes
@@ -564,7 +581,10 @@ for idx_tab, K in enumerate(Ks):
     P_df = pd.DataFrame(P, index=labels, columns=labels)
     chg_df = p_change_table(P)
     chg_df.index = labels
-    emp_df = empirical_p_event(states_sm, base_states, int(n_base), int(n_out))
+
+    # empírico: onset pelo início e offset pelo fim
+    emp_on_df = empirical_p_event(states_sm, base_states_start, int(n_base), int(n_out))
+    emp_off_df = empirical_p_event(states_sm, base_states_end, int(n_base), int(n_out))
 
     # salva no out
     out[f"state_K{K}"] = states_sm
@@ -577,9 +597,10 @@ for idx_tab, K in enumerate(Ks):
 
     # marca picos/componentes (2)
     for j in [1, 2]:
-        out[f"peak{j}_K{K}"] = 0
-        out[f"comp{j}_start_K{K}"] = 0
-        out[f"comp{j}_end_K{K}"] = 0
+        if f"peak{j}_K{K}" not in out.columns:
+            out[f"peak{j}_K{K}"] = 0
+            out[f"comp{j}_start_K{K}"] = 0
+            out[f"comp{j}_end_K{K}"] = 0
 
     if len(comps) >= 1:
         s1, e1, p1 = comps[0]
@@ -597,15 +618,16 @@ for idx_tab, K in enumerate(Ks):
     row = {
         "K": K,
         "Método": method,
-        "Baseline states": ", ".join(map(str, base_states)),
+        "Baseline início": ", ".join(map(str, base_states_start)),
+        "Baseline fim": ", ".join(map(str, base_states_end)),
         "Início global (s)": on_s,
         "Fim global (s)": off_s,
         "Duração global (s)": dur_s,
         "#transições": int(np.sum(states_sm[1:] != states_sm[:-1])),
         "Picos detectados": len(peaks),
+        "Extra": extra,
     }
 
-    # comp1/comp2 tempos
     if len(comps) >= 1:
         s1, e1, p1 = comps[0]
         row.update({
@@ -628,7 +650,6 @@ for idx_tab, K in enumerate(Ks):
     else:
         row.update({"Pico2 (s)": np.nan, "Comp2 início (s)": np.nan, "Comp2 fim (s)": np.nan, "Comp2 duração (s)": np.nan})
 
-    row["Extra"] = extra
     results.append(row)
 
     # ============================================================
@@ -637,12 +658,22 @@ for idx_tab, K in enumerate(Ks):
     with tabs[idx_tab]:
         st.subheader(f"{method} | {extra}")
         st.write(
-            f"**Baseline states (top-m):** {', '.join(map(str, base_states))}  \n"
-            f"**Início global:** {on_s:.3f}s | **Fim global:** {off_s:.3f}s | **Duração:** {dur_s:.3f}s"
-            if np.isfinite(on_s) and np.isfinite(off_s)
-            else f"**Baseline states (top-m):** {', '.join(map(str, base_states))}  \n"
-                 f"**Início/Fim global:** não detectado com (n_base={n_base}, n_out={n_out})"
+            f"**Baseline início:** {', '.join(map(str, base_states_start))} | "
+            f"**Baseline fim:** {', '.join(map(str, base_states_end))}"
         )
+
+        if np.isfinite(on_s):
+            st.write(f"**Início global:** {on_s:.3f}s")
+        else:
+            st.warning(f"Início global não detectado com (n_base={n_base}, n_out={n_out}).")
+
+        if np.isfinite(off_s):
+            st.write(f"**Fim global (pela baseline do fim):** {off_s:.3f}s")
+        else:
+            st.warning("Fim global não detectado (retorno à baseline do fim).")
+
+        if np.isfinite(dur_s):
+            st.write(f"**Duração global:** {dur_s:.3f}s")
 
         st.pyplot(
             plot_signal_marks_components(
@@ -652,7 +683,7 @@ for idx_tab, K in enumerate(Ks):
                 offset_idx=off,
                 peaks=peaks,
                 comps=comps,
-                title="Sinal + onset/offset + 2 picos + limites dos componentes (baseline via estados)",
+                title="Sinal + onset (baseline início) + offset (baseline fim) + 2 picos + componentes",
                 ylabel=sig_name
             )
         )
@@ -669,13 +700,15 @@ for idx_tab, K in enumerate(Ks):
             st.caption("P(mudar) por estado")
             st.dataframe(chg_df.round(3), use_container_width=True)
         with c3:
-            st.caption("Evento global por sequência (empírico)")
-            st.dataframe(emp_df.round(4), use_container_width=True)
+            st.caption("Evento (empírico) – baseline início")
+            st.dataframe(emp_on_df.round(4), use_container_width=True)
+            st.caption("Evento (empírico) – baseline fim")
+            st.dataframe(emp_off_df.round(4), use_container_width=True)
 
         st.caption(
-            "Componentes: após achar cada pico dentro de [onset..offset], "
-            "busca retrógrada/anterógrada no vetor de estados (semi-Markov) até encontrar uma run de baseline "
-            f"com tamanho n_base={n_base}. O início é após a run anterior; o fim é antes da run posterior."
+            "Offset global: detectado como retorno para os estados dominantes na janela FINAL. "
+            "Depois, os 2 maiores picos são buscados dentro de [onset..offset]. "
+            "Os limites de cada componente são obtidos por busca retrógrada/anterógrada até run de baseline (n_base)."
         )
 
 # ============================================================
@@ -693,6 +726,6 @@ with tabs[len(Ks) + 1]:
     st.download_button(
         "📥 Baixar CSV (preprocess + estados + onset/offset + picos + componentes)",
         out.to_csv(index=False).encode("utf-8"),
-        file_name="markov_preprocess_peaks_components.csv",
+        file_name="markov_preprocess_peaks_components_endbaseline.csv",
         mime="text/csv",
     )
