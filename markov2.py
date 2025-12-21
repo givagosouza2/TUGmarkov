@@ -331,9 +331,9 @@ def plot_signal_marks_components(t_s, y, onset_idx, offset_idx, peaks, comps, ti
     ax.plot(t_s, y, linewidth=1, label="sinal")
 
     if onset_idx is not None:
-        ax.axvline(t_s[onset_idx], linestyle="--", label="início global")
+        ax.axvline(t_s[onset_idx], linestyle="--k", label="início global")
     if offset_idx is not None:
-        ax.axvline(t_s[offset_idx], linestyle="--", label="fim global")
+        ax.axvline(t_s[offset_idx], linestyle="--k", label="fim global")
 
     for i, p in enumerate(peaks, start=1):
         ax.axvline(t_s[p], linestyle=":", linewidth=1.2, label=f"pico {i}")
