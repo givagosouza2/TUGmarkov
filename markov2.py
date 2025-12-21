@@ -1,12 +1,14 @@
-# markov_xyz_preprocess_peaks_endbaseline.py
+# markov_xyz_preprocess_peaks_endbaseline_fix_components.py
 # Streamlit app:
 #  - preprocess: interp 100 Hz + detrend + LP 1.5 Hz
 #  - discretize states: K-means (ordered) or quantile bins
 #  - semi-Markov smoothing: merge short runs
 #  - global onset: baseline states from START window
-#  - global offset: baseline states from END window (dominant at the end)
+#  - global offset: baseline states from END window (dominant at the end), searched only after onset
 #  - 2 largest peaks within [onset..offset]
-#  - component bounds for each peak: retro/antero search for baseline (states) with run length n_base
+#  - component bounds for each peak:
+#       start: retro-search to baseline of START
+#       end:   antero-search to baseline of END   (fix requested)
 
 import numpy as np
 import pandas as pd
@@ -19,8 +21,8 @@ from scipy.signal import butter, filtfilt, detrend, find_peaks
 # ============================================================
 # PAGE
 # ============================================================
-st.set_page_config(page_title="Markov – Transientes + baseline do fim", layout="wide")
-st.title("📌 Markov / Semi-Markov — 2 transientes (picos) + offset pela baseline do fim")
+st.set_page_config(page_title="Markov – Transientes + baseline do fim (fix)", layout="wide")
+st.title("📌 Markov / Semi-Markov — 2 transientes (picos) + fim por baseline do fim (corrigido)")
 
 # ============================================================
 # IO
@@ -137,11 +139,6 @@ def dominant_states_in_window(states, mask, top_m=1):
     return vc.index[:top_m].to_numpy()
 
 def detect_seq(states, base_states, n_base, n_out):
-    """
-    onset: n_base baseline -> n_out não-baseline
-    offset: n_out não-baseline -> n_base baseline (última ocorrência)
-    Retorna (onset_idx, offset_idx).
-    """
     states = np.asarray(states)
     base_states = np.atleast_1d(base_states)
     is_base = np.isin(states, base_states)
@@ -193,11 +190,6 @@ def empirical_p_event(states, base_states, n_base, n_out):
     )
 
 def detect_offset_after_onset(states, base_states_end, onset_idx, n_base, n_out):
-    """
-    Procura offset (retorno para baseline do fim) APENAS após onset_idx.
-    Offset definido como: n_out fora da baseline_end seguidos de n_base na baseline_end.
-    Retorna último offset encontrado.
-    """
     states = np.asarray(states)
     base_states_end = np.atleast_1d(base_states_end)
     is_base_end = np.isin(states, base_states_end)
@@ -278,10 +270,19 @@ def find_baseline_run_forward(is_base, start_idx, n_base):
         j += 1
     return None
 
-def component_bounds_from_peak(states_sm, base_states, peak_idx, n_base=5, clamp=(None, None)):
+def component_bounds_from_peak_two_baselines(
+    states_sm,
+    base_states_back,
+    base_states_fwd,
+    peak_idx,
+    n_base=5,
+    clamp=(None, None),
+):
+    """
+    start_idx: após run baseline (n_base) ANTES do pico (baseline do início)
+    end_idx:   antes de run baseline (n_base) APÓS o pico (baseline do fim)
+    """
     states_sm = np.asarray(states_sm)
-    base_states = np.atleast_1d(base_states)
-    is_base = np.isin(states_sm, base_states)
 
     N = len(states_sm)
     i0, i1 = clamp
@@ -292,13 +293,21 @@ def component_bounds_from_peak(states_sm, base_states, peak_idx, n_base=5, clamp
 
     peak_idx = int(np.clip(int(peak_idx), int(i0), int(i1)))
 
-    j_back = find_baseline_run_backward(is_base, peak_idx, int(n_base))
+    # BACK (baseline início)
+    base_states_back = np.atleast_1d(base_states_back)
+    is_base_back = np.isin(states_sm, base_states_back)
+
+    j_back = find_baseline_run_backward(is_base_back, peak_idx, int(n_base))
     if j_back is None or j_back < i0:
         start_idx = int(i0)
     else:
         start_idx = int(min(i1, j_back + 1))
 
-    j_fwd = find_baseline_run_forward(is_base, peak_idx, int(n_base))
+    # FWD (baseline fim)
+    base_states_fwd = np.atleast_1d(base_states_fwd)
+    is_base_fwd = np.isin(states_sm, base_states_fwd)
+
+    j_fwd = find_baseline_run_forward(is_base_fwd, peak_idx, int(n_base))
     if j_fwd is None or j_fwd > i1:
         end_idx = int(i1)
     else:
@@ -330,16 +339,16 @@ def plot_signal_marks_components(t_s, y, onset_idx, offset_idx, peaks, comps, ti
     ax.plot(t_s, y, linewidth=1, label="sinal")
 
     if onset_idx is not None:
-        ax.axvline(t_s[onset_idx], linestyle="--", color="black", label="início global")
+        ax.axvline(t_s[onset_idx], linestyle="--", label="início global")
     if offset_idx is not None:
-        ax.axvline(t_s[offset_idx], linestyle="--", color="black", label="fim global")
+        ax.axvline(t_s[offset_idx], linestyle="--", label="fim global")
 
     for i, p in enumerate(peaks, start=1):
-        ax.axvline(t_s[p], linestyle=":", linewidth=1.2, color="red", label=f"pico {i}")
+        ax.axvline(t_s[p], linestyle=":", linewidth=1.2, label=f"pico {i}")
 
     for i, (s, e, _p) in enumerate(comps, start=1):
-        ax.axvline(t_s[s], linestyle="-.", linewidth=1.2, color="red", label=f"comp{i} início")
-        ax.axvline(t_s[e], linestyle="-.", linewidth=1.2, color="red", label=f"comp{i} fim")
+        ax.axvline(t_s[s], linestyle="-.", linewidth=1.2, label=f"comp{i} início")
+        ax.axvline(t_s[e], linestyle="-.", linewidth=1.2, label=f"comp{i} fim")
 
     ax.set_title(title)
     ax.set_xlabel("Tempo (s)")
@@ -375,7 +384,7 @@ with st.sidebar:
     baseline_s = st.number_input("Janela baseline início (s)", 0.05, 30.0, 2.0, 0.1)
     top_m_base = st.number_input("Top-m estados (início)", 1, 5, 1, 1)
 
-    st.header("Baseline do fim (offset)")
+    st.header("Baseline do fim (offset e fim dos componentes)")
     end_baseline_s = st.number_input("Janela baseline fim (s)", 0.05, 30.0, 2.0, 0.1)
     top_m_end = st.number_input("Top-m estados (fim)", 1, 5, 1, 1)
 
@@ -477,17 +486,15 @@ st.caption(
     f"| fs_final=**{fs:.2f}Hz** | N=**{len(t_s)}** | sinal=**{sig_name}**"
 )
 
-# masks baseline
 base_mask_start = t_s <= float(baseline_s)
 t_end0 = t_s[-1] - float(end_baseline_s)
-base_mask_end = t_s >= t_end0
+base_mask_end = t_s >= float(t_end0)
 
 if base_mask_start.sum() < max(10, 2 * int(min_run)):
     st.warning("Poucas amostras na baseline do início (aumente baseline_s ou reduza min_run).")
 if base_mask_end.sum() < max(10, 2 * int(min_run)):
     st.warning("Poucas amostras na baseline do fim (aumente end_baseline_s ou reduza min_run).")
 
-# prévia
 if not run_btn:
     fig, ax = plt.subplots(figsize=(12, 4.0))
     ax.plot(t_s, sig, linewidth=1)
@@ -522,7 +529,6 @@ out = pd.DataFrame(
 for idx_tab, K in enumerate(Ks):
     K = int(K)
 
-    # discretiza
     if method == "Quantis (bins)":
         states, edges = discretize_quantile_bins(sig, K)
         extra = f"edges≈{np.round(edges, 6)}"
@@ -530,24 +536,22 @@ for idx_tab, K in enumerate(Ks):
         states, centers_sorted = discretize_kmeans_1d(sig, K)
         extra = f"centers≈{np.round(centers_sorted, 6)}"
 
-    # semi-markov
     states_sm = merge_short_runs(states, int(min_run))
 
-    # baseline states: início e fim
     base_states_start = dominant_states_in_window(states_sm, base_mask_start, top_m=int(top_m_base))
     base_states_end = dominant_states_in_window(states_sm, base_mask_end, top_m=int(top_m_end))
 
-    # onset usando baseline do início
+    # onset via baseline início
     on, _ = detect_seq(states_sm, base_states_start, int(n_base), int(n_out))
 
-    # offset usando baseline do fim (somente após onset)
+    # offset via baseline fim (após onset)
     off = detect_offset_after_onset(states_sm, base_states_end, on, int(n_base), int(n_out))
 
     on_s = idx_to_time(t_s, on)
     off_s = idx_to_time(t_s, off)
     dur_s = (off_s - on_s) if (on is not None and off is not None) else np.nan
 
-    # picos e componentes no intervalo onset..offset
+    # picos e componentes em [on..off]
     peaks = []
     comps = []  # [(s,e,p), ...]
     if on is not None and off is not None and off > on + max(10, int(0.3 * fs)):
@@ -563,9 +567,10 @@ for idx_tab, K in enumerate(Ks):
         )
 
         for p in peaks:
-            s_i, e_i = component_bounds_from_peak(
+            s_i, e_i = component_bounds_from_peak_two_baselines(
                 states_sm=states_sm,
-                base_states=base_states_start,   # usa baseline do início como "repouso" local do componente
+                base_states_back=base_states_start,  # <-- back: baseline início
+                base_states_fwd=base_states_end,     # <-- fwd: baseline fim (fix)
                 peak_idx=p,
                 n_base=int(n_base),
                 clamp=(on, off),
@@ -574,7 +579,6 @@ for idx_tab, K in enumerate(Ks):
 
         comps.sort(key=lambda x: x[2])
 
-    # matrizes
     C, P = transition_matrix(states_sm, K)
     labels = [f"S{i+1}" for i in range(K)]
     C_df = pd.DataFrame(C, index=labels, columns=labels)
@@ -582,11 +586,9 @@ for idx_tab, K in enumerate(Ks):
     chg_df = p_change_table(P)
     chg_df.index = labels
 
-    # empírico: onset pelo início e offset pelo fim
     emp_on_df = empirical_p_event(states_sm, base_states_start, int(n_base), int(n_out))
     emp_off_df = empirical_p_event(states_sm, base_states_end, int(n_base), int(n_out))
 
-    # salva no out
     out[f"state_K{K}"] = states_sm
     out[f"onset_K{K}"] = 0
     out[f"offset_K{K}"] = 0
@@ -595,7 +597,6 @@ for idx_tab, K in enumerate(Ks):
     if off is not None:
         out.loc[off, f"offset_K{K}"] = 1
 
-    # marca picos/componentes (2)
     for j in [1, 2]:
         if f"peak{j}_K{K}" not in out.columns:
             out[f"peak{j}_K{K}"] = 0
@@ -612,9 +613,8 @@ for idx_tab, K in enumerate(Ks):
         s2, e2, p2 = comps[1]
         out.loc[p2, f"peak2_K{K}"] = 1
         out.loc[s2, f"comp2_start_K{K}"] = 1
-        out.loc[e2, f"comp2_end_K{K}"] = 1
+        out.loc[e2, f"comp2_end_K{K}"] = 1  # <-- fim do 2º componente (busca pela baseline do fim)
 
-    # resumo
     row = {
         "K": K,
         "Método": method,
@@ -652,9 +652,6 @@ for idx_tab, K in enumerate(Ks):
 
     results.append(row)
 
-    # ============================================================
-    # UI por K
-    # ============================================================
     with tabs[idx_tab]:
         st.subheader(f"{method} | {extra}")
         st.write(
@@ -668,7 +665,7 @@ for idx_tab, K in enumerate(Ks):
             st.warning(f"Início global não detectado com (n_base={n_base}, n_out={n_out}).")
 
         if np.isfinite(off_s):
-            st.write(f"**Fim global (pela baseline do fim):** {off_s:.3f}s")
+            st.write(f"**Fim global (baseline do fim):** {off_s:.3f}s")
         else:
             st.warning("Fim global não detectado (retorno à baseline do fim).")
 
@@ -683,7 +680,7 @@ for idx_tab, K in enumerate(Ks):
                 offset_idx=off,
                 peaks=peaks,
                 comps=comps,
-                title="Sinal + onset (baseline início) + offset (baseline fim) + 2 picos + componentes",
+                title="Sinal + onset (baseline início) + offset (baseline fim) + 2 picos + componentes (fim pelo fim)",
                 ylabel=sig_name
             )
         )
@@ -698,7 +695,7 @@ for idx_tab, K in enumerate(Ks):
             st.dataframe(P_df.round(3), use_container_width=True)
         with c2:
             st.caption("P(mudar) por estado")
-            st.dataframe(chg_df.round(3), use_container_width=True)
+            st.dataframe(p_change_table(P).round(3), use_container_width=True)
         with c3:
             st.caption("Evento (empírico) – baseline início")
             st.dataframe(emp_on_df.round(4), use_container_width=True)
@@ -706,26 +703,20 @@ for idx_tab, K in enumerate(Ks):
             st.dataframe(emp_off_df.round(4), use_container_width=True)
 
         st.caption(
-            "Offset global: detectado como retorno para os estados dominantes na janela FINAL. "
-            "Depois, os 2 maiores picos são buscados dentro de [onset..offset]. "
-            "Os limites de cada componente são obtidos por busca retrógrada/anterógrada até run de baseline (n_base)."
+            "✅ Correção aplicada: os LIMITES dos componentes usam duas baselines: "
+            "retro (início) e antero (fim). Assim, o fim do 2º componente procura "
+            "retorno ao(s) estado(s) mais frequente(s) na janela FINAL."
         )
 
-# ============================================================
-# TAB: comparativo
-# ============================================================
 with tabs[len(Ks)]:
     st.subheader("Comparativo (todos os K)")
     st.dataframe(pd.DataFrame(results), use_container_width=True)
 
-# ============================================================
-# TAB: download
-# ============================================================
 with tabs[len(Ks) + 1]:
     st.subheader("Download")
     st.download_button(
         "📥 Baixar CSV (preprocess + estados + onset/offset + picos + componentes)",
         out.to_csv(index=False).encode("utf-8"),
-        file_name="markov_preprocess_peaks_components_endbaseline.csv",
+        file_name="markov_preprocess_peaks_components_endbaseline_fix.csv",
         mime="text/csv",
     )
